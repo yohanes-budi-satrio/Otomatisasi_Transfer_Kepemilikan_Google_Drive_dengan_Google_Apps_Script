@@ -1,0 +1,80 @@
+const PREVIOUS_OWNER = '...@gmail.com'; // isi dengan akun gmail pemilik lama
+const MY_EMAIL = '...@gmail.com'; // isi dengan akun gmail sebagai pemilik baru
+const BATAS_WAKTU_EKSEKUSI = 4.5 * 60 * 1000; 
+
+// JALANKAN FUNGSI INI SATU KALI SAJA UNTUK MEMULAI KEMBALI
+function mulaiTerimaTransfer() {
+  PropertiesService.getScriptProperties().deleteProperty('PAGE_TOKEN_KEPATUHAN');
+  terimaOtomatis();
+}
+
+function terimaOtomatis() {
+  // PENTING: Bersihkan trigger yang telah usang di awal eksekusi
+  // Ini untuk mencegah penumpukan trigger yang melebihi batas Google (20 limit)
+  hapusSemuaTrigger('terimaOtomatis');
+  
+  const waktuMulai = Date.now();
+  const props = PropertiesService.getScriptProperties();
+  let pageToken = props.getProperty('PAGE_TOKEN_KEPATUHAN');
+  
+  if (pageToken === 'START') pageToken = null;
+
+  do {
+    // Mencari file yang dimiliki arsip (mengecualikan file sistem apps script)
+    const response = Drive.Files.list({
+      q: `'${PREVIOUS_OWNER}' in owners and mimeType != 'application/vnd.google-apps.script'`, 
+      fields: "nextPageToken, files(id, name, permissions(id, emailAddress, role, pendingOwner))",
+      pageToken: pageToken || undefined,
+      pageSize: 100
+    });
+    
+    const files = response.files;
+    if (files && files.length > 0) {
+      for (let i = 0; i < files.length; i++) {
+        
+        // Pengecekan waktu: Jika 4.5 menit tercapai, buat alarm baru
+        if (Date.now() - waktuMulai > BATAS_WAKTU_EKSEKUSI) {
+          props.setProperty('PAGE_TOKEN_KEPATUHAN', pageToken || 'START');
+          ScriptApp.newTrigger('terimaOtomatis').timeBased().after(60 * 1000).create();
+          Logger.log('⏱️ Waktu hampir habis. Menyimpan progres dan akan lanjut otomatis 1 menit lagi...');
+          return; 
+        }
+
+        const file = files[i];
+        try {
+          const permissions = file.permissions || [];
+          const myPerm = permissions.find(p => p.emailAddress === MY_EMAIL);
+          
+          // Mencegah Error: Skip jika kita ternyata sudah menjadi owner penuh
+          if (myPerm && myPerm.role === 'owner') continue;
+
+          // Eksekusi hanya jika status kita sedang pendingOwner
+          if (myPerm && myPerm.pendingOwner === true) {
+            Drive.Permissions.update({
+              role: 'owner'
+            }, file.id, myPerm.id, { transferOwnership: true });
+            
+            // PENCATATAN LOG (Menampilkan nama file yang diterima)
+            Logger.log('👑 Berhasil terima: ' + file.name);
+          }
+        } catch (e) {
+          Logger.log('❌ Error saat menerima file ' + file.name + ': ' + e.message);
+        }
+      }
+    }
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+  
+  Logger.log('✅ SEMUA KEPEMILIKAN FILE BERHASIL DIAMBIL ALIH!');
+  props.deleteProperty('PAGE_TOKEN_KEPATUHAN');
+}
+
+// Fungsi wajib untuk membersihkan alarm/trigger
+function hapusSemuaTrigger(namaFungsi) {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === namaFungsi) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}

@@ -1,0 +1,153 @@
+const TARGET_EMAIL = '...@gmail.com'; // isi dengan akun gmail yang akan anda tunjuk sebagai pemilik baru
+const BATAS_WAKTU_EKSEKUSI = 4.5 * 60 * 1000; // 4.5 menit (aman dari limit 6 menit)
+
+// JALANKAN FUNGSI INI SATU KALI SAJA UNTUK MEMULAI
+function mulaiInisiasiTransfer() {
+  hapusSemuaTrigger('inisiasiOtomatis');
+  PropertiesService.getScriptProperties().deleteProperty('PAGE_TOKEN_ARSIP');
+  inisiasiOtomatis();
+}
+
+function inisiasiOtomatis() {
+  const waktuMulai = Date.now();
+  const props = PropertiesService.getScriptProperties();
+  let pageToken = props.getProperty('PAGE_TOKEN_ARSIP');
+  
+  // Jika token berupa string khusus 'START', jadikan null agar mulai dari halaman awal
+  if (pageToken === 'START') pageToken = null; 
+
+  do {
+    // Mengecualikan file apps script milik sistem agar tidak error
+    const response = Drive.Files.list({
+      q: "'me' in owners and mimeType != 'application/vnd.google-apps.script'", 
+      fields: "nextPageToken, files(id, name, permissions(id, emailAddress, role, pendingOwner))",
+      pageToken: pageToken || undefined,
+      pageSize: 100 // Diproses per 100 file agar hemat memori
+    });
+    
+    const files = response.files;
+    if (files && files.length > 0) {
+      for (let i = 0; i < files.length; i++) {
+        
+        // Pengecekan waktu: Jika sudah mendekati 4.5 menit, jeda dan buat trigger
+        if (Date.now() - waktuMulai > BATAS_WAKTU_EKSEKUSI) {
+          props.setProperty('PAGE_TOKEN_ARSIP', pageToken || 'START');
+          ScriptApp.newTrigger('inisiasiOtomatis').timeBased().after(60 * 1000).create();
+          Logger.log('Waktu hampir habis. Menyimpan progres dan melanjutkannya dalam 1 menit...');
+          return; // Hentikan eksekusi saat ini
+        }
+
+        const file = files[i];
+        try {
+          const permissions = file.permissions || [];
+          const targetPerm = permissions.find(p => p.emailAddress === TARGET_EMAIL);
+          
+          if (targetPerm) {
+            // MENCEGAH ERROR: Skip jika target sudah jadi owner atau sudah pending owner
+            if (targetPerm.role === 'owner') continue;
+            if (targetPerm.pendingOwner === true) continue;
+            
+            Drive.Permissions.update({
+              role: 'writer',
+              pendingOwner: true
+            }, file.id, targetPerm.id);
+          } else {
+            Drive.Permissions.create({
+              type: 'user',
+              role: 'writer',
+              emailAddress: TARGET_EMAIL,
+              pendingOwner: true
+            }, file.id, { sendNotificationEmail: false });
+          }
+        } catch (e) {
+          Logger.log('Error file ' + file.name + ': ' + e.message);
+        }
+      }
+    }
+    
+    // Pindah ke halaman/batch berikutnya
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+  
+  // JIKA SAMPAI DI SINI, BERARTI SEMUA FILE SUDAH SELESAI
+  Logger.log('✅ SEMUA FILE SELESAI DIINISIASI!');
+  props.deleteProperty('PAGE_TOKEN_ARSIP');
+  hapusSemuaTrigger('inisiasiOtomatis');
+}
+
+// Fungsi pembantu untuk membersihkan antrean tugas (trigger)
+function hapusSemuaTrigger(namaFungsi) {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === namaFungsi) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
+
+// JALANKAN FUNGSI INI SATU KALI SAJA UNTUK MEMBATALKAN TRANSFER
+function mulaiBatalTransfer() {
+  hapusSemuaTrigger('batalOtomatis');
+  PropertiesService.getScriptProperties().deleteProperty('PAGE_TOKEN_BATAL');
+  batalOtomatis();
+}
+
+function batalOtomatis() {
+  const waktuMulai = Date.now();
+  const props = PropertiesService.getScriptProperties();
+  let pageToken = props.getProperty('PAGE_TOKEN_BATAL');
+  
+  if (pageToken === 'START') pageToken = null;
+
+  do {
+    // Mengecualikan file apps script milik sistem
+    const response = Drive.Files.list({
+      q: "'me' in owners and mimeType != 'application/vnd.google-apps.script'", 
+      fields: "nextPageToken, files(id, name, permissions(id, emailAddress, role, pendingOwner))",
+      pageToken: pageToken || undefined,
+      pageSize: 100 
+    });
+    
+    const files = response.files;
+    if (files && files.length > 0) {
+      for (let i = 0; i < files.length; i++) {
+        
+        // Pengecekan batas waktu (maksimal 4.5 menit)
+        if (Date.now() - waktuMulai > BATAS_WAKTU_EKSEKUSI) {
+          props.setProperty('PAGE_TOKEN_BATAL', pageToken || 'START');
+          ScriptApp.newTrigger('batalOtomatis').timeBased().after(60 * 1000).create();
+          Logger.log('⏱️ Waktu hampir habis. Menyimpan progres pembatalan dan melanjutkannya dalam 1 menit...');
+          return; 
+        }
+
+        const file = files[i];
+        try {
+          const permissions = file.permissions || [];
+          
+          // Cari spesifik permission akun target yang statusnya MASIH pendingOwner
+          const targetPerm = permissions.find(p => p.emailAddress === TARGET_EMAIL && p.pendingOwner === true);
+          
+          if (targetPerm) {
+            // Cabut status pending owner, kembalikan hanya sebagai writer biasa
+            Drive.Permissions.update({
+              role: 'writer',
+              pendingOwner: false
+            }, file.id, targetPerm.id);
+            
+            // PENCATATAN LOG BERHASIL
+            Logger.log('🚫 Batal transfer sukses: ' + file.name);
+          }
+        } catch (e) {
+          Logger.log('❌ Error pembatalan pada file ' + file.name + ': ' + e.message);
+        }
+      }
+    }
+    
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+  
+  // Jika loop selesai, berarti seluruh file sudah diproses
+  Logger.log('✅ SEMUA PEMBATALAN TRANSFER SELESAI!');
+  props.deleteProperty('PAGE_TOKEN_BATAL');
+  hapusSemuaTrigger('batalOtomatis');
+}
